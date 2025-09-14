@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless WebSocket Chat (API Gateway v2 + Lambda + DynamoDB)
+
+Parameters:
+  StageName:
+    Type: String
+    Default: dev
+    Description: API Gateway Stage name (e.g., dev, prod)
+
+Globals:
+  Function:
+    Timeout: 5
+    MemorySize: 128
+    Runtime: provided.al2023     # go1.x は廃止。カスタムランタイムを使用
+    Handler: bootstrap           # カスタムランタイムは固定で bootstrap
+
+Resources:
+  # --- DynamoDB: connections table ---
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: connections
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+        - AttributeName: roomId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: roomId-index
+          KeySchema:
+            - AttributeName: roomId
+              KeyType: HASH
+          Projection:
+            ProjectionType: KEYS_ONLY
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # --- API Gateway (WebSocket) ---
+  ChatApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: ChatWsApi
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  DevStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: !Ref StageName
+      ApiId: !Ref ChatApi
+      AutoDeploy: true
+
+  # --- Lambda: $connect ---
+  OnConnectFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../lambda/connect/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: connections
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: connections
+    Metadata:
+      BuildMethod: go1.x      # SAM に Go ビルド方法を指示
+
+  # --- Lambda: $disconnect ---
+  OnDisconnectFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../lambda/disconnect/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: connections
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: connections
+    Metadata:
+      BuildMethod: go1.x
+
+  # --- Lambda: sendMessage ---
+  SendMessageFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../lambda/send/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: connections
+        - Statement:
+            - Effect: Allow
+              Action: execute-api:ManageConnections
+              Resource: "*"
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: connections
+          APIGW_MGMT_ENDPOINT: !Sub
+            - "https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+            - { ApiId: !Ref ChatApi, Stage: !Ref StageName }
+    Metadata:
+      BuildMethod: go1.x
+
+  # --- Integrations ---
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ChatApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnConnectFn.Arn}/invocations
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ChatApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnDisconnectFn.Arn}/invocations
+
+  SendMessageIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ChatApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMessageFn.Arn}/invocations
+
+  # --- Routes ---
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ChatApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${ConnectIntegration}"
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ChatApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${DisconnectIntegration}"
+
+  SendMessageRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ChatApi
+      RouteKey: sendMessage
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${SendMessageIntegration}"
+
+  # --- Permissions (API Gateway -> Lambda invoke) ---
+  ConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OnConnectFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  DisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OnDisconnectFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  SendMessagePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SendMessageFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+Outputs:
+  WebSocketUrl:
+    Description: WebSocket endpoint (use in frontend)
+    Value: !Sub
+      - "wss://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+      - { ApiId: !Ref ChatApi, Stage: !Ref StageName }
+
+  MgmtEndpoint:
+    Description: API Gateway Management API endpoint (use in Lambda send)
+    Value: !Sub
+      - "https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+      - { ApiId: !Ref ChatApi, Stage: !Ref StageName }
